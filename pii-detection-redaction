@@ -1,0 +1,53 @@
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from anthropic import Anthropic
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+# Ensure the ANTHROPIC_API_KEY from the .env is loaded into the environment
+if not os.getenv("ANTHROPIC_API_KEY"):
+    raise RuntimeError("ANTHROPIC_API_KEY not set in environment. Ensure .env contains ANTHROPIC_API_KEY")
+
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+client = Anthropic()
+
+def redact_pii(text: str) -> tuple[str, list]:
+    """Detect and redact PII. Returns (redacted_text, found_entities)."""
+    results = analyzer.analyze(
+        text=text,
+        entities=["PERSON", "PHONE_NUMBER", "EMAIL_ADDRESS",
+                  "CREDIT_CARD", "US_SSN", "US_BANK_NUMBER", "IBAN_CODE"],
+        language="en"
+    )
+    redacted = anonymizer.anonymize(text=text, analyzer_results=results)
+    return redacted.text, results
+
+def safe_llm_call(user_input: str) -> str:
+    """Always redact before sending to LLM."""
+    redacted, entities = redact_pii(user_input)
+    
+    if entities:
+        print(f"⚠️  Redacted {len(entities)} PII entities before LLM call")
+        for e in entities:
+            print(f"   - {e.entity_type} (score: {e.score:.2f})")
+    
+    response = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        system="You are a banking assistant. Answer questions about payments and accounts.",
+        messages=[{"role": "user", "content": redacted}]
+    )
+    return response.content[0].text
+
+# Test it — notice the PII gets stripped before the LLM sees it
+test_input = """
+My name is John Smith, SSN 123-45-6789. 
+My account number is 4532-1234-5678-9012.
+What's the wire transfer limit for my account?
+"""
+
+result = safe_llm_call(test_input)
+print("\nLLM Response:", result)

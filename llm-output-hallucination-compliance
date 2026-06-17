@@ -1,0 +1,152 @@
+from anthropic import Anthropic
+from dataclasses import dataclass
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+# Ensure the ANTHROPIC_API_KEY from the .env is loaded into the environment
+if not os.getenv("ANTHROPIC_API_KEY"):
+    raise RuntimeError("ANTHROPIC_API_KEY not set in environment. Ensure .env contains ANTHROPIC_API_KEY")
+
+
+client = Anthropic()
+
+@dataclass
+class GuardrailResult:
+    passed: bool
+    confidence: float
+    reason: str
+    action: str  # "allow", "warn", "block", "escalate"
+
+COMPLIANCE_RULES = """
+Banking compliance rules you must enforce:
+1. Never provide specific investment advice or stock recommendations
+2. Never guarantee investment returns
+3. Never quote specific interest rates without a disclaimer about variability
+4. Never share account details that weren't provided by the user
+5. Always recommend consulting a financial advisor for major decisions
+6. Flag any mention of transactions over $10,000 (BSA reporting threshold)
+"""
+
+def check_hallucination(llm_response: str, source_context: str) -> GuardrailResult:
+    """Verify LLM response is grounded in provided context."""
+    import re
+    check = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        system="""You are a fact-checker. Given a source context and an AI response,
+        determine if the response contains claims NOT supported by the context.
+        Reply ONLY with:
+        GROUNDED: <confidence 0-1>
+        or
+        HALLUCINATION: <confidence 0-1> | <specific unsupported claim>""",
+        messages=[{"role": "user", "content": 
+            f"Context:\n{source_context}\n\nAI Response:\n{llm_response}"}]
+    )
+    result = check.content[0].text.strip()
+    
+    try:
+        if result.startswith("GROUNDED"):
+            # Extract confidence score using regex to handle malformed responses
+            match = re.search(r':\s*([0-9.]+)', result)
+            if match:
+                conf = float(match.group(1))
+            else:
+                conf = 0.95  # Default high confidence if parsing fails
+            return GuardrailResult(True, conf, "Response grounded in context", "allow")
+        else:
+            parts = result.split("|")
+            match = re.search(r':\s*([0-9.]+)', parts[0])
+            if match:
+                conf = float(match.group(1))
+            else:
+                conf = 0.5  # Default neutral confidence if parsing fails
+            claim = parts[1].strip() if len(parts) > 1 else "Unknown claim"
+            return GuardrailResult(False, conf, f"Hallucination: {claim}", "block")
+    except (ValueError, IndexError) as e:
+        print(f"Warning: Error parsing hallucination check result: {result}")
+        print(f"Error details: {e}")
+        return GuardrailResult(True, 0.5, "Failed to parse hallucination check", "allow")
+
+def check_compliance(llm_response: str) -> GuardrailResult:
+    """Check response against banking compliance rules."""
+    import re
+    check = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        system=f"""{COMPLIANCE_RULES}
+        
+        Analyze if the response violates any rule above.
+        Reply ONLY with:
+        COMPLIANT: <confidence 0-1>
+        or
+        VIOLATION: <confidence 0-1> | <rule violated> | <escalate/block>""",
+        messages=[{"role": "user", "content": f"Check this response:\n{llm_response}"}]
+    )
+    result = check.content[0].text.strip()
+    
+    try:
+        if result.startswith("COMPLIANT"):
+            # Extract confidence score using regex to handle malformed responses
+            match = re.search(r':\s*([0-9.]+)', result)
+            if match:
+                conf = float(match.group(1))
+            else:
+                conf = 0.95  # Default high confidence if parsing fails
+            return GuardrailResult(True, conf, "Compliant", "allow")
+        else:
+            parts = result.split("|")
+            match = re.search(r':\s*([0-9.]+)', parts[0])
+            if match:
+                conf = float(match.group(1))
+            else:
+                conf = 0.5  # Default neutral confidence if parsing fails
+            rule = parts[1].strip() if len(parts) > 1 else "Unknown rule"
+            action = parts[2].strip() if len(parts) > 2 else "block"
+            return GuardrailResult(False, conf, f"Rule violated: {rule}", action)
+    except (ValueError, IndexError) as e:
+        print(f"Warning: Error parsing compliance check result: {result}")
+        print(f"Error details: {e}")
+        return GuardrailResult(True, 0.5, "Failed to parse compliance check", "allow")
+
+def guarded_response(user_query: str, context: str) -> str:
+    """Full output guardrail pipeline."""
+    
+    # 1. Generate LLM response
+    raw_response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=512,
+        system="You are a banking assistant. Answer based only on provided context.",
+        messages=[
+            {"role": "user", "content": f"Context: {context}\n\nQuestion: {user_query}"}
+        ]
+    ).content[0].text
+    
+    print(f"Raw LLM response:\n{raw_response}\n")
+    
+    # 2. Hallucination check
+    hall_result = check_hallucination(raw_response, context)
+    print(f"Hallucination check: {'✅' if hall_result.passed else '🚫'} {hall_result.reason}")
+    
+    if not hall_result.passed:
+        return "I can only provide information based on verified data. Please consult your account portal."
+    
+    # 3. Compliance check
+    comp_result = check_compliance(raw_response)
+    print(f"Compliance check: {'✅' if comp_result.passed else '🚫'} {comp_result.reason}")
+    
+    if not comp_result.passed:
+        if comp_result.action == "escalate":
+            # In production: route to human reviewer queue
+            print("⚠️  Escalating to compliance team")
+            return "This query requires review by our compliance team. A specialist will respond within 1 business day."
+        return "I'm unable to provide that information. Please consult a financial advisor."
+    
+    return raw_response
+
+# Test with a banking context
+context = "Corporate wire transfer limit is $500,000 per day. Standard processing is 1-2 business days."
+query = "What's the wire limit and can you guarantee same-day processing?"
+result = guarded_response(query, context)
+print(f"\nFinal response:\n{result}")
